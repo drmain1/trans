@@ -1,0 +1,839 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS HealthScribe Physician Transcription MVP'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Deployment environment
+  
+  AppName:
+    Type: String
+    Default: healthscribe-mvp
+    Description: Name of the application
+  
+  AdminEmail:
+    Type: String
+    Description: Email address for admin user
+  
+  GitHubRepository:
+    Type: String
+    Description: GitHub repository URL for the application code
+  
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub personal access token for Amplify deployment
+
+Resources:
+  # S3 Buckets
+  AudioBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AppName}-audio-${Environment}-${AWS::AccountId}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3000
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldFiles
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AppName}-output-${Environment}-${AWS::AccountId}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3000
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  
+  # DynamoDB Tables
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AppName}-jobs-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIdIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  
+  # Cognito Resources
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AppName}-user-pool-${Environment}
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: 'OPTIONAL'
+      EnabledMfas:
+        - SMS_MFA
+        - SOFTWARE_TOKEN_MFA
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailMessage: 'Your username is {username} and temporary password is {####}.'
+          EmailSubject: 'Your temporary password for HealthScribe MVP'
+          SMSMessage: 'Your username is {username} and temporary password is {####}.'
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: specialty
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+        - Name: department
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      UserPoolAddOns:
+        AdvancedSecurityMode: ENFORCED
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      UsernameAttributes:
+        - email
+  
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub ${AppName}-${Environment}-${AWS::AccountId}
+      UserPoolId: !Ref UserPool
+  
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AppName}-client-${Environment}
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+  
+  UserPoolAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      Description: Administrator group
+      GroupName: Administrators
+      Precedence: 1
+      UserPoolId: !Ref UserPool
+  
+  UserPoolPhysicianGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      Description: Physicians group
+      GroupName: Physicians
+      Precedence: 2
+      UserPoolId: !Ref UserPool
+  
+  UserPoolStaffGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      Description: Staff group
+      GroupName: Staff
+      Precedence: 3
+      UserPoolId: !Ref UserPool
+  
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub ${AppName}-identity-pool-${Environment}
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+  
+  AdminUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      Username: !Ref dr.david.main@thejoint.com
+      UserPoolId: !Ref UserPool
+      UserAttributes:
+        - Name: email
+          Value: !Ref dr.david.main@thejoint.com
+        - Name: email_verified
+          Value: "true"
+  
+  AdminUserGroupAttachment:
+    Type: AWS::Cognito::UserPoolUserToGroupAttachment
+    Properties:
+      GroupName: Administrators
+      Username: !Ref dr.david.main@thejoint.com
+      UserPoolId: !Ref UserPool
+    DependsOn:
+      - AdminUser
+      - UserPoolAdminGroup
+  
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt AuthenticatedRole.Arn
+  
+  # IAM Roles
+  AuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud: !Ref IdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: authenticated
+      Policies:
+        - PolicyName: AuthenticatedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub arn:aws:s3:::${AudioBucket}/*
+                  - !Sub arn:aws:s3:::${OutputBucket}/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${AudioBucket}
+                  - !Sub arn:aws:s3:::${OutputBucket}
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt JobsTable.Arn
+                  - !Sub ${JobsTable.Arn}/index/UserIdIndex
+  
+  HealthScribeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: healthscribe.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: HealthScribeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${AudioBucket}/*
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${OutputBucket}/*
+  
+  # Lambda Functions
+  AudioProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-audio-processor-${Environment}
+      Handler: index.handler
+      Role: !GetAtt AudioProcessorRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const s3 = new AWS.S3();
+          const healthscribe = new AWS.HealthScribe();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+            // Get the uploaded file details from the event
+            const bucket = event.Records[0].s3.bucket.name;
+            const key = event.Records[0].s3.object.key;
+            
+            // Extract user ID from the key (assuming format: userId/recordings/filename)
+            const keyParts = key.split('/');
+            const userId = keyParts[0];
+            
+            // Configure HealthScribe job
+            const params = {
+              MediaFileUri: `s3://${bucket}/${key}`,
+              OutputBucketName: process.env.OUTPUT_BUCKET,
+              OutputKey: key.replace('recordings', 'transcripts'),
+              JobName: `Transcription-${Date.now()}`,
+              DataAccessRoleArn: process.env.HEALTHSCRIBE_ROLE_ARN,
+              Settings: {
+                TranscribeSettings: {
+                  ShowSpeakerLabels: true,
+                  MaxSpeakerLabels: 2
+                },
+                ClinicalDocumentationSettings: {
+                  NoteTemplateType: "SOAP"
+                }
+              }
+            };
+            
+            try {
+              // Start HealthScribe job
+              const response = await healthscribe.startMedicalScribeJob(params).promise();
+              
+              // Store job information in DynamoDB
+              const ttl = Math.floor(Date.now() / 1000) + (90 * 24 * 60 * 60); // 90 days TTL
+              await dynamodb.put({
+                TableName: process.env.JOBS_TABLE,
+                Item: {
+                  jobId: response.JobId,
+                  userId: userId,
+                  status: 'IN_PROGRESS',
+                  sourceKey: key,
+                  outputKey: key.replace('recordings', 'transcripts'),
+                  createdAt: new Date().toISOString(),
+                  ttl: ttl
+                }
+              }).promise();
+              
+              console.log('Job started successfully:', response.JobId);
+              
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ jobId: response.JobId })
+              };
+            } catch (error) {
+              console.error('Error starting HealthScribe job:', error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ error: error.message })
+              };
+            }
+          };
+      Runtime: nodejs18.x
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputBucket
+          HEALTHSCRIBE_ROLE_ARN: !GetAtt HealthScribeRole.Arn
+          JOBS_TABLE: !Ref JobsTable
+  
+  JobStatusCheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-job-status-checker-${Environment}
+      Handler: index.handler
+      Role: !GetAtt JobStatusCheckerRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const healthscribe = new AWS.HealthScribe();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const lambda = new AWS.Lambda();
+          
+          exports.handler = async (event) => {
+            // Scan DynamoDB for in-progress jobs
+            const scanParams = {
+              TableName: process.env.JOBS_TABLE,
+              FilterExpression: '#status = :status',
+              ExpressionAttributeNames: {
+                '#status': 'status'
+              },
+              ExpressionAttributeValues: {
+                ':status': 'IN_PROGRESS'
+              }
+            };
+            
+            try {
+              const scanResult = await dynamodb.scan(scanParams).promise();
+              
+              // Process each in-progress job
+              const updatePromises = scanResult.Items.map(async (job) => {
+                const jobStatusParams = {
+                  JobId: job.jobId
+                };
+                
+                const jobStatus = await healthscribe.getMedicalScribeJob(jobStatusParams).promise();
+                
+                // Update job status in DynamoDB
+                if (jobStatus.JobStatus !== 'IN_PROGRESS') {
+                  await dynamodb.update({
+                    TableName: process.env.JOBS_TABLE,
+                    Key: { jobId: job.jobId },
+                    UpdateExpression: 'SET #status = :status, updatedAt = :updatedAt',
+                    ExpressionAttributeNames: {
+                      '#status': 'status'
+                    },
+                    ExpressionAttributeValues: {
+                      ':status': jobStatus.JobStatus,
+                      ':updatedAt': new Date().toISOString()
+                    }
+                  }).promise();
+                  
+                  // If job completed, trigger post-processing
+                  if (jobStatus.JobStatus === 'COMPLETED') {
+                    await lambda.invoke({
+                      FunctionName: process.env.NOTE_FORMATTER_FUNCTION,
+                      InvocationType: 'Event',
+                      Payload: JSON.stringify({
+                        jobId: job.jobId,
+                        outputKey: job.outputKey
+                      })
+                    }).promise();
+                  }
+                }
+                
+                return {
+                  jobId: job.jobId,
+                  status: jobStatus.JobStatus
+                };
+              });
+              
+              const results = await Promise.all(updatePromises);
+              
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ 
+                  processed: results.length,
+                  jobs: results
+                })
+              };
+            } catch (error) {
+              console.error('Error checking job statuses:', error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ error: error.message })
+              };
+            }
+          };
+      Runtime: nodejs18.x
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          NOTE_FORMATTER_FUNCTION: !Ref NoteFormatterFunction.Arn
+  
+  NoteFormatterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-note-formatter-${Environment}
+      Handler: index.handler
+      Role: !GetAtt NoteFormatterRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const s3 = new AWS.S3();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+            const jobId = event.jobId;
+            const outputKey = event.outputKey;
+            
+            try {
+              // Get job details from DynamoDB
+              const jobResult = await dynamodb.get({
+                TableName: process.env.JOBS_TABLE,
+                Key: { jobId: jobId }
+              }).promise();
+              
+              const job = jobResult.Item;
+              
+              // Get the output file from S3
+              const s3Result = await s3.getObject({
+                Bucket: process.env.OUTPUT_BUCKET,
+                Key: outputKey
+              }).promise();
+              
+              // Parse the clinical documentation
+              const clinicalDoc = JSON.parse(s3Result.Body.toString('utf-8'));
+              
+              // Format the notes for EHR integration
+              const formattedNotes = formatNotesForEHR(clinicalDoc);
+              
+              // Store formatted notes in S3
+              const formattedKey = outputKey.replace('transcripts', 'formatted-notes');
+              await s3.putObject({
+                Bucket: process.env.OUTPUT_BUCKET,
+                Key: formattedKey,
+                Body: JSON.stringify(formattedNotes),
+                ContentType: 'application/json'
+              }).promise();
+              
+              // Update job in DynamoDB
+              await dynamodb.update({
+                TableName: process.env.JOBS_TABLE,
+                Key: { jobId: jobId },
+                UpdateExpression: 'SET formattedKey = :formattedKey, status = :status, updatedAt = :updatedAt',
+                ExpressionAttributeValues: {
+                  ':formattedKey': formattedKey,
+                  ':status': 'FORMATTED',
+                  ':updatedAt': new Date().toISOString()
+                }
+              }).promise();
+              
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ 
+                  jobId: jobId, 
+                  status: 'FORMATTED',
+                  formattedKey: formattedKey
+                })
+              };
+            } catch (error) {
+              console.error('Error formatting notes:', error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ error: error.message })
+              };
+            }
+          };
+          
+          // Helper function to format notes for EHR integration
+          function formatNotesForEHR(clinicalDoc) {
+            // Implementation will depend on the specific EHR system requirements
+            // This is a placeholder for the actual implementation
+            
+            const formatted = {
+              metadata: {
+                formatVersion: "1.0",
+                generatedAt: new Date().toISOString()
+              },
+              patientInfo: {},
+              sections: {}
+            };
+            
+            // Extract and format sections from the clinicalDoc
+            if (clinicalDoc.sections) {
+              for (const section of clinicalDoc.sections) {
+                formatted.sections[section.sectionType] = {
+                  content: section.text,
+                  evidence: section.evidence
+                };
+              }
+            }
+            
+            return formatted;
+          }
+      Runtime: nodejs18.x
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          OUTPUT_BUCKET: !Ref OutputBucket
+  
+  AudioProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: HealthScribeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - healthscribe:StartMedicalScribeJob
+                  - healthscribe:GetMedicalScribeJob
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${AudioBucket}/*
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${OutputBucket}/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt JobsTable.Arn
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt HealthScribeRole.Arn
+  
+  JobStatusCheckerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: JobStatusCheckerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - healthscribe:GetMedicalScribeJob
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt JobsTable.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt NoteFormatterFunction.Arn
+  
+  NoteFormatterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: NoteFormatterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${OutputBucket}/*
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${OutputBucket}/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt JobsTable.Arn
+  
+  # S3 Trigger for Lambda
+  AudioBucketLambdaTrigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AudioProcessorFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${AudioBucket}
+  
+  AudioBucketNotification:
+    Type: AWS::S3::BucketNotification
+    Properties:
+      Bucket: !Ref AudioBucket
+      LambdaConfigurations:
+        - Event: s3:ObjectCreated:*
+          Filter:
+            S3Key:
+              Rules:
+                - Name: prefix
+                  Value: recordings/
+          Function: !GetAtt AudioProcessorFunction.Arn
+  
+  # CloudWatch Events for Job Status Checker
+  JobStatusCheckerSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AppName}-job-status-checker-schedule-${Environment}
+      Description: Scheduled job to check HealthScribe job statuses
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt JobStatusCheckerFunction.Arn
+          Id: JobStatusCheckerTarget
+  
+  JobStatusCheckerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref JobStatusCheckerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt JobStatusCheckerSchedule.Arn
+  
+  # Amplify App
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Sub ${AppName}-${Environment}
+      Description: HealthScribe MVP Application
+      Repository: !Ref GitHubRepository
+      AccessToken: !Ref GitHubToken
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: build
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - node_modules/**/*
+      EnvironmentVariables:
+        - Name: AMPLIFY_IDENTITYPOOL_ID
+          Value: !Ref IdentityPool
+        - Name: AMPLIFY_USERPOOL_ID
+          Value: !Ref UserPool
+        - Name: AMPLIFY_USERPOOL_CLIENT_ID
+          Value: !Ref UserPoolClient
+        - Name: AMPLIFY_REGION
+          Value: !Ref AWS::Region
+        - Name: AMPLIFY_AUDIO_BUCKET
+          Value: !Ref AudioBucket
+        - Name: AMPLIFY_OUTPUT_BUCKET
+          Value: !Ref OutputBucket
+        - Name: AMPLIFY_JOBS_TABLE
+          Value: !Ref JobsTable
+
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: main
+      EnableAutoBuild: true
+      EnvironmentVariables:
+        - Name: ENVIRONMENT
+          Value: !Ref Environment
+
+Outputs:
+  AmplifyAppId:
+    Description: Amplify App ID
+    Value: !GetAtt AmplifyApp.AppId
+  
+  AmplifyURL:
+    Description: Amplify App URL
+    Value: !Sub https://${AmplifyBranch.BranchName}.${AmplifyApp.DefaultDomain}
+  
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+  
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+  
+  IdentityPoolId:
+    Description: Cognito Identity Pool ID
+    Value: !Ref IdentityPool
+  
+  AudioBucketName:
+    Description: S3 Bucket for Audio Recordings
+    Value: !Ref AudioBucket
+  
+  OutputBucketName:
+    Description: S3 Bucket for Transcriptions and Notes
+    Value: !Ref OutputBucket
+  
+  JobsTableName:
+    Description: DynamoDB Table for Job Tracking
+    Value: !Ref JobsTable
